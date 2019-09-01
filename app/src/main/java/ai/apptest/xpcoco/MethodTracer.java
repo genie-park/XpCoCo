@@ -1,7 +1,6 @@
 package ai.apptest.xpcoco;
 import android.content.pm.*;
-import android.os.Environment;
-import android.util.*;
+import android.util.Log;
 import dalvik.system.*;
 import de.robv.android.xposed.*;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
@@ -12,6 +11,8 @@ import java.io.*;
 import java.lang.reflect.*;
 import java.util.*;
 import android.app.*;
+import android.os.Handler;
+import android.os.Looper;
 
 
 public class MethodTracer implements IXposedHookLoadPackage, IXposedHookZygoteInit {
@@ -19,23 +20,21 @@ public class MethodTracer implements IXposedHookLoadPackage, IXposedHookZygoteIn
     private String TAG_INJECTION = "ExCoCo_I";
     public static final String THIS_PACKAGE_NAME = MethodTracer.class.getPackage().getName();
     public static XSharedPreferences sPrefs;
-    HashMap<String, Boolean> InjectedHash;
 
     public void initZygote(StartupParam startupParam) throws Throwable {
-        InjectedHash = new HashMap<String, Boolean>();
         sPrefs = new XSharedPreferences(THIS_PACKAGE_NAME, "Configuration");
         sPrefs.makeWorldReadable();
     }
 
-    private void deleteLogFile(){
-        String path = Environment.getExternalStorageDirectory().getAbsolutePath() + "/ExCoCo/coco_e.txt";
+    private void deleteLogFile(String logdir ){
+        String path = logdir + "/ExCoCo/coco_i.txt";
         File file = new File(path);
         if (file.exists())
             if(!file.delete())
                 XposedBridge.log("Can't delete file: " + path );
             else
                 XposedBridge.log("Log file is deleted : " + path );
-        path = Environment.getExternalStorageDirectory().getAbsolutePath() + "/ExCoCo/coco_e.txt";
+        path = logdir + "/ExCoCo/coco_e.txt";
         file = new File(path);
         if (file.exists())
             if(!file.delete())
@@ -44,30 +43,29 @@ public class MethodTracer implements IXposedHookLoadPackage, IXposedHookZygoteIn
                 XposedBridge.log("Log file is deleted : " + path );
     }
 
-    private Boolean isAbstractMethod(Method method){
-        String[] methodDescription = method.toString().split(" ");
+    private Boolean isAbstractMethod(String methodFullName){
+        String[] methodDescription = methodFullName.split(" ");
         for ( String Description : methodDescription)
             if( Description.equals("abstract")) return true;
         return false;
     }
 
-    private Boolean isjnected(String className, String MethodName) {
-        if(InjectedHash.containsKey(className + "::" + MethodName ))
-            return true;
-        else
-            return false;
+    private Boolean isExcluded(String className) {
+        String[] ExcludeTarget = {"android.", "com.android.", "com.google.android.",
+                "com.google.dexmaker.", "org.apache.commons.", "org.apache.http.*",
+                "org.apache.log4j.*"};
+        for (String excludedClassName : ExcludeTarget){
+            if (className.startsWith(excludedClassName)) return true;
+        }
+        return false;
     }
 
-    private void CheckAsInjected (String className, String MethodName) {
-        InjectedHash.put(className + "::" + MethodName, true);
-    }
-
-    private Boolean writeToFile(String tag, String log){
+    private Boolean writeToFile(String logDir, String tag, String log){
         String absolutePath;
         if(tag.equals(TAG_EXECUTION)){
-            absolutePath = Environment.getExternalStorageDirectory().getAbsolutePath() + "/ExCoCo/coco_e.txt";
+            absolutePath = logDir + "/ExCoCo/coco_e.txt";
         }else{
-            absolutePath = Environment.getExternalStorageDirectory().getAbsolutePath() + "/ExCoCo/coco_i.txt";
+            absolutePath = logDir + "/ExCoCo/coco_i.txt";
         }
 
         try {
@@ -104,12 +102,40 @@ public class MethodTracer implements IXposedHookLoadPackage, IXposedHookZygoteIn
     }
 
     public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable{
+        sPrefs.reload();
+        //check if this module is enable
+        if (lpparam.packageName.equals("ai.apptest.xpcoco")) {
+            //workaround to bypass MODE_PRIVATE of shared_prefs
+            findAndHookMethod("android.app.SharedPreferencesImpl.EditorImpl", lpparam.classLoader, "notifyListeners",
+                    "android.app.SharedPreferencesImpl.MemoryCommitResult", new XC_MethodHook() {
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            //workaround to bypass the concurrency (io)
+                            Handler handler = new Handler(Looper.getMainLooper());
+                            handler.postDelayed(new Runnable() {
+                                public void run() {
+                                    File folder = new File("/data/data/ai.apptest.xpcoco/");
+                                    folder.setExecutable(true, false);
+                                    String mPrefFile = "/data/data/ai.apptest.xpcoco/shared_prefs/Configuration.xml";
+                                    (new File(mPrefFile)).setReadable(true, false);
+                                }
+                            }, 1000);
+                        }
+                    });
+        }
+
+        if(lpparam.packageName.equals("ai.apptest.xpcoco")) return;
 
         String injectionTarget = sPrefs.getString("InjectionTarget", null );
+        XposedBridge.log("injection Target : " + injectionTarget );
+        if (!lpparam.packageName.equals(injectionTarget)) return;
 
-        if (!lpparam.packageName.equals(injectionTarget)){
-            return;
-        }
+        ApplicationInfo applicationInfo = AndroidAppHelper.currentApplicationInfo();
+
+        final String logDir = applicationInfo.dataDir;
+        XposedBridge.log("logdir is: " + logDir );
+        File folder = new File(logDir);
+        folder.setExecutable(true, false);
+        deleteLogFile(logDir);
 
         findAndHookMethod("android.util.Log", lpparam.classLoader, "e", String.class, String.class, new XC_MethodHook() {
             @Override
@@ -117,11 +143,10 @@ public class MethodTracer implements IXposedHookLoadPackage, IXposedHookZygoteIn
                 String tag = (String) param.args[0];
                 String log = (String) param.args[1];
                 if (tag.equals(TAG_EXECUTION) || tag.equals(TAG_INJECTION))
-                    writeToFile(tag, log);
+                    writeToFile(logDir, tag, log);
             }
         });
 
-        ApplicationInfo applicationInfo = AndroidAppHelper.currentApplicationInfo();
         if (applicationInfo.processName.equals(injectionTarget)){
             Set<String> classes = new HashSet<>();
             DexFile dex;
@@ -138,22 +163,30 @@ public class MethodTracer implements IXposedHookLoadPackage, IXposedHookZygoteIn
                 Log.e(TAG_INJECTION, e.toString());
             }
 
-            deleteLogFile();
+            String[] PackageNames = injectionTarget.split("\\.");
+//            String SubPackageName = PackageNames [0] + "." + PackageNames[1];
+            String SubPackageName = PackageNames[0];
+            XposedBridge.log("sub Package name is : " + SubPackageName );
+
+            HashMap<String, Boolean> InjectedHash = new HashMap<String, Boolean>();
             for (String className : classes){
-                if (className.startsWith(injectionTarget)){
+//                if (className.startsWith(SubPackageName)){
+                if(!isExcluded(className)){
                     try{
                         Class clazz = lpparam.classLoader.loadClass(className);
                         for (Method method : clazz.getDeclaredMethods()){
                             if(!method.getDeclaringClass().getName().equals(className)) continue;
-                            if(this.isAbstractMethod(method)) continue;
 
-                            String methodName = method.getName() ;
-                            if(isjnected(className, methodName)) continue;
+                            String methodDescription = method.toString();
+                            if(this.isAbstractMethod(methodDescription)) continue;
+                            if(InjectedHash.containsKey(methodDescription)) continue;
+                            InjectedHash.put(methodDescription, true);
+
+                            String methodName = method.getName ();
                             final String traceLog = className  + '\t' + methodName ;
-                            CheckAsInjected(className, methodName);
                             Log.e(TAG_INJECTION, traceLog);
 
-                            XposedBridge.hookAllMethods(clazz, method.getName(), new XC_MethodHook() {
+                            XposedBridge.hookMethod(method, new XC_MethodHook() {
                                 @Override
                                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                                     Log.e(TAG_EXECUTION,traceLog);
